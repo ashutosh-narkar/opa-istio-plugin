@@ -33,6 +33,7 @@ import (
 	internal_util "github.com/open-policy-agent/opa-envoy-plugin/internal/util"
 	"github.com/open-policy-agent/opa-envoy-plugin/opa/decisionlog"
 	"github.com/open-policy-agent/opa/ast"
+	"github.com/open-policy-agent/opa/metrics"
 	"github.com/open-policy-agent/opa/plugins"
 	"github.com/open-policy-agent/opa/rego"
 	"github.com/open-policy-agent/opa/server"
@@ -110,6 +111,9 @@ func New(m *plugins.Manager, cfg *Config) plugins.Plugin {
 		interQueryBuiltinCache: iCache.NewInterQueryCache(m.InterQueryBuiltinCacheConfig()),
 	}
 
+	// add a counter for load testing
+	plugin.loadMet = metrics.New()
+
 	// Register Authorization Server
 	ext_authz_v3.RegisterAuthorizationServer(plugin.server, plugin)
 	ext_authz_v2.RegisterAuthorizationServer(plugin.server, &envoyExtAuthzV2Wrapper{v3: plugin})
@@ -145,6 +149,7 @@ type envoyExtAuthzGrpcServer struct {
 	preparedQuery          *rego.PreparedEvalQuery
 	preparedQueryDoOnce    *sync.Once
 	interQueryBuiltinCache iCache.InterQueryCache
+	loadMet                metrics.Metrics
 }
 
 type envoyExtAuthzV2Wrapper struct {
@@ -247,12 +252,84 @@ func (p *envoyExtAuthzGrpcServer) listen() {
 
 	p.manager.UpdatePluginStatus(PluginName, &plugins.Status{State: plugins.StateOK})
 
+	go func() {
+		t := time.Tick(time.Second * 10)
+		for {
+			<-t
+			p.printRow()
+		}
+	}()
+
 	if err := p.server.Serve(l); err != nil {
 		logrus.WithField("err", err).Fatal("Listener failed.")
 	}
 
 	logrus.Info("Listener exited.")
 	p.manager.UpdatePluginStatus(PluginName, &plugins.Status{State: plugins.StateNotReady})
+}
+
+func (p *envoyExtAuthzGrpcServer) printMetrics() {
+	fmt.Printf("%v\n", p.loadMet)
+}
+
+func (p *envoyExtAuthzGrpcServer) printRow() {
+
+	row := map[string]interface{}{}
+
+	metricKeysServer := []string{
+		"server_handler(count)",
+		"server_handler(min)",
+		"server_handler(mean)",
+		"server_handler(median)",
+		"server_handler(75%)",
+		"server_handler(90%)",
+		"server_handler(99%)",
+		"server_handler(99.9%)",
+		"server_handler(99.99%)",
+	}
+
+	metricKeysRego := []string{
+		"rego_query_eval(count)",
+		"rego_query_eval(min)",
+		"rego_query_eval(mean)",
+		"rego_query_eval(median)",
+		"rego_query_eval(75%)",
+		"rego_query_eval(90%)",
+		"rego_query_eval(99%)",
+		"rego_query_eval(99.9%)",
+		"rego_query_eval(99.99%)",
+	}
+
+	hists := []string{metrics.ServerHandler, metrics.RegoQueryEval}
+
+	for _, h := range hists {
+		hist := p.loadMet.Histogram(h).Value().(map[string]interface{})
+
+		keys := []string{"count", "min", "mean", "median", "75%", "90%", "99%", "99.9%", "99.99%"}
+		for i := range keys {
+			switch x := hist[keys[i]].(type) {
+			case int64:
+				if keys[i] == "count" {
+					row[fmt.Sprintf("%v(%v)", h, keys[i])] = x
+				} else {
+					row[fmt.Sprintf("%v(%v)", h, keys[i])] = time.Duration(x)
+				}
+			case float64:
+				row[fmt.Sprintf("%v(%v)", h, keys[i])] = time.Duration(x)
+			default:
+				panic("bad type")
+			}
+		}
+	}
+
+	for _, k := range metricKeysServer {
+		fmt.Printf("%v: %-14v ", k, row[k])
+	}
+	fmt.Print("\n")
+	for _, k := range metricKeysRego {
+		fmt.Printf("%v: %-14v ", k, row[k])
+	}
+	fmt.Print("\n\n")
 }
 
 // Check is envoy.service.auth.v3.Authorization/Check
@@ -265,6 +342,8 @@ func (p *envoyExtAuthzGrpcServer) Check(ctx context.Context, req *ext_authz_v3.C
 }
 
 func (p *envoyExtAuthzGrpcServer) check(ctx context.Context, req interface{}) (*ext_authz_v3.CheckResponse, func() *rpc_status.Status, error) {
+	//p.loadMet.Counter("server_requests").Incr() <- this count is included in the server handler and rego query histogram
+
 	var err error
 	start := time.Now()
 
@@ -279,6 +358,9 @@ func (p *envoyExtAuthzGrpcServer) check(ctx context.Context, req interface{}) (*
 
 	stop := func() *rpc_status.Status {
 		stopeval()
+		p.loadMet.Histogram(metrics.ServerHandler).Update(result.Metrics.Timer(metrics.ServerHandler).Int64())
+		p.loadMet.Histogram(metrics.RegoQueryEval).Update(result.Metrics.Timer(metrics.RegoQueryEval).Int64())
+
 		logErr := p.log(ctx, input, result, err)
 		if logErr != nil {
 			return &rpc_status.Status{
